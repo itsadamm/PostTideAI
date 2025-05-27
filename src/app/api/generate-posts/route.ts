@@ -2,8 +2,30 @@ import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../auth/[...nextauth]/route";
+import type { UnsplashSearchResponse } from "@/types/unsplash";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+async function fetchUnsplashImage(
+  query: string
+): Promise<{ url: string; alt: string } | null> {
+  const endpoint = 'https://api.unsplash.com/search/photos' + 
+  `?query=${encodeURIComponent(query)}` + 
+  `&per_page=1&orientation=squarish`;
+
+  const res = await fetch(endpoint, {
+    headers: {Authorization: `Client-ID ${process.env.UNSPASH_ACCESS_KEY}`},
+    next: { revalidate: 24 * 60 * 60 }, // 24 h cache
+  });
+
+  if (!res.ok) return null;
+
+  const data: UnsplashSearchResponse = await res.json();
+  if (data.results.length === 0) return null; 
+
+  const { urls, alt_description } = data.results[0];
+  return { url: urls.regular, alt: alt_description ?? query };
+}
 
 export async function POST(req: Request) {
   /* -------------------------------------------------- auth check */
@@ -39,7 +61,15 @@ export async function POST(req: Request) {
     const raw = completion.choices[0].message?.content ?? "{}";
     const { captions } = JSON.parse(raw) as { captions: string[] };
 
-    return NextResponse.json({ captions });
+        // fetch one Unsplash image using the industry keyword 
+    const image = await fetchUnsplashImage(industry);
+    const payload = captions.map((c) => ({
+      caption: c,
+      imageUrl: image?.url ?? null,
+      alt: image?.alt ?? industry,
+    }));
+
+    return NextResponse.json({ payload });
   } catch (err: unknown) {
     console.error("OPENAI error ➜", err);
     return NextResponse.json(
