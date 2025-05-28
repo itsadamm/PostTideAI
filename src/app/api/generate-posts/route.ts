@@ -32,83 +32,100 @@ async function fetchUnsplashImage(
   const endpoint =
     "https://api.unsplash.com/search/photos" +
     `?query=${encodeURIComponent(query)}` +
-    `&per_page=1&orientation=squarish`;
+    "&per_page=1&orientation=squarish";
 
-  /* Unsplash auth uses the public “Access Key” in a header            */
   const res = await fetch(endpoint, {
     headers: { Authorization: `Client-ID ${process.env.UNSPLASH_ACCESS_KEY}` },
-    /* Cache each (query) result for 24 h so repeated calls are free    */
-    next: { revalidate: 24 * 60 * 60 },
+    next: { revalidate: 86400 }, // cache 24 h
   });
-
-  /* Network / HTTP error → skip photo gracefully                      */
   if (!res.ok) return null;
 
   const data: UnsplashSearchResponse = await res.json();
-  if (data.results.length === 0) return null;
+  if (!data.results.length) return null;
 
-  /* Grab the regular-size URL + alt-text (or fall back to query)      */
   const { urls, alt_description } = data.results[0];
   return { url: urls.regular, alt: alt_description ?? query };
 }
 
 /* ------------------------------------------------------------------ */
-/*  3. POST /api/generate-posts                                       */
+/*  3. JSON extractor (robust)                                        */
+/* ------------------------------------------------------------------ */
+/** Remove ``` fences, then return the first { … } block if any. */
+function extractJsonBlock(raw: string): string | null {
+  // Strip ``` blocks (```json or ```).
+  const withoutTicks = raw.replace(/```(?:json)?|```/gi, "").trim();
+  // Grab first brace to last brace inclusive.
+  const match = withoutTicks.match(/{[\s\S]*}/);
+  return match ? match[0] : null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  4. POST handler                                                   */
 /* ------------------------------------------------------------------ */
 export async function POST(req: Request) {
-  /* ---------- a) Authorise user ----------------------------------- */
+  /* ---------- a) Auth ---------- */
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  /* ---------- b) Validate request body ---------------------------- */
+  /* ---------- b) Validate body --*/
   const { industry, tone, length } = await req.json();
   if (!industry || !tone || !length) {
     return NextResponse.json({ error: "Missing parameters" }, { status: 400 });
   }
 
-  /* ---------- c) Build OpenAI prompt ------------------------------ */
+  /* ---------- c) Prompt ---------*/
   const system =
     'You are a social-media copywriter. Always reply ONLY with valid JSON of the form {"captions": string[]}.';
-
   const userPrompt = `Write ${length} social-media captions for a business in the ${industry} industry. Tone: ${tone}. Return JSON only.`;
 
   try {
-    /* ---------- d) Call OpenAI in strict JSON mode ---------------- */
+    /* ---------- d) OpenAI call ---*/
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      response_format: { type: "json_object" }, // guarantees JSON
+      response_format: { type: "json_object" },
       messages: [
         { role: "system", content: system },
         { role: "user", content: userPrompt },
       ],
       temperature: 0.6,
-      max_tokens: length * 40, // generous upper bound
+      max_tokens: length * 40,
     });
 
-    /* ---------- e) Parse captions from reply ---------------------- */
+    /* ---------- e) Parse captions
+         1. Try strict JSON.parse on raw content.
+         2. If it fails, run extractJsonBlock() then parse again.
+         3. If both fail, throw to outer catch (returns 502).          */
     const raw = completion.choices[0].message?.content ?? "{}";
-    const { captions } = JSON.parse(raw) as { captions: string[] };
+    let captions: string[];
 
-    /* ---------- f) Fetch one Unsplash image ----------------------- */
+    try {
+      ({ captions } = JSON.parse(raw) as { captions: string[] });
+    } catch {
+      const cleaned = extractJsonBlock(raw);
+      if (!cleaned) throw new Error("No JSON found in model output");
+      ({ captions } = JSON.parse(cleaned) as { captions: string[] });
+    }
+
+    /* ---------- f) Unsplash -------*/
     const image = await fetchUnsplashImage(industry);
 
-    /* ---------- g) Merge caption + image into payload ------------- */
-    const payload = captions.map((c) => ({
+    /* ---------- g) Build payload --*/
+    const results = captions.map((c) => ({
       caption: c,
       imageUrl: image?.url ?? null,
       alt: image?.alt ?? industry,
     }));
 
-    /* ---------- h) Return to client ------------------------------ */
-    return NextResponse.json({ results: payload }); // <- shape the UI expects
+    /* ---------- h) Respond --------*/
+    return NextResponse.json({ results });
   } catch (err: unknown) {
-    /* Any error (OpenAI, JSON parse, Unsplash) lands here            */
-    console.error("OPENAI error ➜", err);
+    /* Any parse/network error ends here. 502 signals “upstream” issue */
+    console.error("generate-posts error ➜", err);
     return NextResponse.json(
       { error: "Failed to generate captions" },
-      { status: 500 }
+      { status: 502 },
     );
   }
 }
