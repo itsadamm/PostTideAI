@@ -24,7 +24,8 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 /*  2. Helper: fetch first Unsplash image for a keyword               */
 /* ------------------------------------------------------------------ */
 async function fetchUnsplashImage(
-  query: string
+  query: string,
+  page = 1
 ): Promise<{ url: string; alt: string } | null> {
   /* Build REST URL:
      - encodeURIComponent handles spaces (“coffee shop” → coffee%20shop)
@@ -32,11 +33,11 @@ async function fetchUnsplashImage(
   const endpoint =
     "https://api.unsplash.com/search/photos" +
     `?query=${encodeURIComponent(query)}` +
-    "&per_page=1&orientation=squarish";
+    `&per_page=1&page=${page}&orientation=landscape`;
 
   const res = await fetch(endpoint, {
     headers: { Authorization: `Client-ID ${process.env.UNSPLASH_ACCESS_KEY}` },
-    next: { revalidate: 86400 }, // cache 24 h
+    next: { revalidate: 86400 }, // 24 h CDN cache
   });
   if (!res.ok) return null;
 
@@ -51,7 +52,7 @@ async function fetchUnsplashImage(
 /*  3. JSON extractor (robust)                                        */
 /* ------------------------------------------------------------------ */
 /** Remove ``` fences, then return the first { … } block if any. */
-function extractJsonBlock(raw: string): string | null {
+function extractJson(raw: string): string | null {
   // Strip ``` blocks (```json or ```).
   const withoutTicks = raw.replace(/```(?:json)?|```/gi, "").trim();
   // Grab first brace to last brace inclusive.
@@ -82,50 +83,62 @@ export async function POST(req: Request) {
 
   try {
     /* ---------- d) OpenAI call ---*/
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.6,
-      max_tokens: length * 40,
-    });
+    let parsedCaptions: string[] | null = null;
 
-    /* ---------- e) Parse captions
-         1. Try strict JSON.parse on raw content.
-         2. If it fails, run extractJsonBlock() then parse again.
-         3. If both fail, throw to outer catch (returns 502).          */
-    const raw = completion.choices[0].message?.content ?? "{}";
-    let captions: string[];
+    for (let attempt = 0; attempt < 2 && !parsedCaptions; attempt++) {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: attempt === 0 ? 0.6 : 0,
+        max_tokens: attempt === 0 ? length * 40 : length * 30,
+      });
 
-    try {
-      ({ captions } = JSON.parse(raw) as { captions: string[] });
-    } catch {
-      const cleaned = extractJsonBlock(raw);
-      if (!cleaned) throw new Error("No JSON found in model output");
-      ({ captions } = JSON.parse(cleaned) as { captions: string[] });
+      const raw = completion.choices[0].message?.content ?? "{}";
+
+      try {
+        const attemptCaps = JSON.parse(raw) as { captions: string[] };
+        parsedCaptions = attemptCaps.captions;
+        break;
+      } catch {
+        const cleaned = extractJson(raw);
+        if (cleaned) {
+          try {
+            const attemptCaps = JSON.parse(cleaned) as { captions: string[] };
+            parsedCaptions = attemptCaps.captions;
+            break;
+          } catch {
+            /* still invalid – loop will retry or bubble out */
+          }
+        }
+      }
     }
 
-    /* ---------- f) Unsplash -------*/
-    const image = await fetchUnsplashImage(industry);
+    if (!parsedCaptions) throw new Error("OpenAI returned invalid JSON twice");
 
-    /* ---------- g) Build payload --*/
-    const results = captions.map((c) => ({
+    /* e) Unsplash photo (random page 1-10 for variety) */
+    const image = await fetchUnsplashImage(
+      industry,
+      Math.floor(Math.random() * 10) + 1
+    );
+
+    /* f) Build payload */
+    const results = parsedCaptions.map((c) => ({
       caption: c,
       imageUrl: image?.url ?? null,
       alt: image?.alt ?? industry,
     }));
 
-    /* ---------- h) Respond --------*/
+    /* g) Respond */
     return NextResponse.json({ results });
-  } catch (err: unknown) {
-    /* Any parse/network error ends here. 502 signals “upstream” issue */
+  } catch (err) {
     console.error("generate-posts error ➜", err);
     return NextResponse.json(
       { error: "Failed to generate captions" },
-      { status: 502 },
+      { status: 502 }
     );
   }
 }
